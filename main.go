@@ -2,10 +2,25 @@ package main
 
 import (
 	model "char/core"
+	"char/errs"
+	"encoding/json"
+	"fmt"
 	"github.com/gorilla/websocket"
+	"io"
 	"log"
 	"net/http"
 	"os"
+)
+
+type Rsp struct {
+	Code int    `json:"Code"`
+	Msg  string `json:"msg"`
+	Data string
+}
+
+const (
+	System = "System"
+	NAMING = 9
 )
 
 func init() {
@@ -18,32 +33,18 @@ func init() {
 	log.SetFlags(log.Ldate | log.Lmicroseconds | log.Llongfile)
 }
 
-//const (
-//	QueryUsers = iota
-//)
-
-//获取全部用户
-func getUsers() []Friend {
-	var friends = make([]Friend, 0, len(connMap))
-	for s, user := range connMap {
-		friends = append(friends, Friend{
-			Token: s,
-			Name:  user.ChineseName,
-		})
-	}
-	return friends
-}
-
 type Friend struct {
 	Token string
 	Name  string
 }
 
-var connMap = make(map[string]model.User)
-var closeChan = make(chan string, 100)
+// ConnMCap 包含全部用户信息
+var ConnMCap = make(map[string]*model.User)
+
+var closeChan = make(chan string, 2)
 
 func main() {
-	closeChan := make(chan string, 100)
+	closeChan = make(chan string, 100)
 	go removeUser(closeChan)
 	http.HandleFunc("/ws", Upgrade)
 	http.HandleFunc("/getFriend", GetFriend)
@@ -57,25 +58,33 @@ func main() {
 func removeUser(closeChan chan string) {
 	for {
 		token := <-closeChan
-		delete(connMap, token)
-		if user, ok := connMap[token]; ok {
-			delete(connMap, token)
+		log.Println(token)
+		if user, ok := ConnMCap[token]; ok {
+			delete(ConnMCap, token)
 			log.Printf("删除成功token:%s,name:%s\n", token, user.ChineseName)
+			continue
 		}
+		log.Printf("删除失败token:%s 不存在\n", token)
 	}
 }
 func GetFriend(writer http.ResponseWriter, _ *http.Request) {
-	_, err := writer.Write([]byte("成功"))
+	rsp := Rsp{}
+	users := getUsers()
+	marshal, err := json.Marshal(users)
 	if err != nil {
 		return
-
 	}
+	_, err = io.WriteString(writer, string(marshal))
+	if err != nil {
+		return
+	}
+	rsp.Code = 20000
+	rsp.Msg = "success"
+	rsp.Data = string(marshal)
+
 }
 
 func Upgrade(w http.ResponseWriter, r *http.Request) {
-	//r.Cookie("name")
-	//log.Println(r.URL.String())
-
 	upgrader := websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -86,26 +95,123 @@ func Upgrade(w http.ResponseWriter, r *http.Request) {
 		log.Println(err)
 		return
 	}
-	user := model.NewUser(conn, "qiang")
+	OnLine(conn)
+}
+
+//获取全部用户
+func getUsers() []Friend {
+	var friends = make([]Friend, 0, len(ConnMCap))
+	for s, user := range ConnMCap {
+		friends = append(friends, Friend{
+			Token: s,
+			Name:  user.ChineseName,
+		})
+	}
+	return friends
+}
+func OnLine(conn *websocket.Conn) {
+	user := model.NewUser(conn, "")
 	log.Println("接入用户:", user)
-	connMap[user.Token] = user
-	go func(token string, closeChan chan<- string) {
-		for {
-			//var msg model.Mess
-			messageType, str, err := conn.ReadMessage()
-			if err != nil {
-				log.Println(err)
-				closeChan <- token
+	ConnMCap[user.Token] = &user
+	go From(&user)
+}
+
+func From(user *model.User) {
+	for {
+		//var msg model.Mess
+		messageType, str, err := user.Conn.ReadMessage()
+		if err != nil {
+			//如果连接关闭,删除map中的值
+			if _, ok := err.(*websocket.CloseError); ok {
+				closeChan <- user.Token
 				return
 			}
-			switch messageType {
-			case websocket.CloseMessage:
-				closeChan <- token
-			case websocket.TextMessage:
-				log.Println(string(str))
-			default:
-				log.Println("接收到无意义数据:", string(str))
-			}
 		}
-	}(user.Token, closeChan)
+		switch messageType {
+		case websocket.CloseMessage:
+			closeChan <- user.Token
+			log.Println("连接关闭")
+		case websocket.TextMessage:
+			err = FilterNoName(user.ChineseName, str)
+			if err != nil {
+				go To(System, user.Token, errs.Msg(err))
+				continue
+			}
+			log.Println(string(str))
+		case -1:
+			log.Println("连接关闭")
+			closeChan <- user.Token
+			return
+		default:
+			log.Println("接收到无意义数据:", string(str))
+		}
+	}
+}
+func To(from, to, msg string) {
+	var fromChineseName string
+	if System == from {
+		fromChineseName = System
+	} else if fromP, is := ConnMCap[from]; is {
+		fromChineseName = fromP.ChineseName
+	} else {
+		log.Println("用户不存在")
+	}
+	toP, is2 := ConnMCap[to]
+	//這裡先不處理用戶下線的情況
+	if !is2 {
+		log.Println("用户不存在")
+		return
+	}
+	messages := model.Messages{
+		From:    fromChineseName,
+		GoTo:    toP.ChineseName,
+		Content: msg,
+	}
+	err := toP.Conn.WriteJSON(messages)
+	log.Println(err)
+}
+func FilterNoName(token string, bytes []byte) error {
+	var fromP = ConnMCap[token]
+	if fromP == nil {
+		return errs.CustomError{
+			Code: 400,
+			Msg:  "用户未登陆",
+		}
+	}
+	var msg model.Messages
+	err := json.Unmarshal(bytes, &msg)
+	if err != nil {
+		return errs.CustomError{
+			Code: 400,
+			Msg:  fmt.Sprint("消息格式有误:", err.Error()),
+		}
+	}
+	if msg.MsgType == NAMING {
+		fromP.ChineseName = msg.Content
+	}
+	if fromP.ChineseName == "" {
+		return errs.CustomError{
+			Code: 400,
+			Msg:  "用户未登陆,请先填写你的昵称！！",
+		}
+	}
+	return nil
+}
+
+func ToUser(from string, to model.User, msg string) {
+	var fromChineseName string
+	if System == from {
+		fromChineseName = System
+	} else if fromP, is := ConnMCap[from]; is {
+		fromChineseName = fromP.ChineseName
+	} else {
+		log.Println("用户不存在")
+	}
+	messages := model.Messages{
+		From:    fromChineseName,
+		GoTo:    to.ChineseName,
+		Content: msg,
+	}
+	err := to.Conn.WriteJSON(messages)
+	log.Println(err)
 }
