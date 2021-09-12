@@ -23,7 +23,7 @@ func Code(err error) int {
 }
 
 func Msg(err error) string {
-	if customError, is := err.(*CustomError); is {
+	if customError, is := err.(CustomError); is {
 		return customError.Msg
 	}
 	return ""

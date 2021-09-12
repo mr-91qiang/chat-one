@@ -132,7 +132,7 @@ func From(user *model.User) {
 			closeChan <- user.Token
 			log.Println("连接关闭")
 		case websocket.TextMessage:
-			err = FilterNoName(user.ChineseName, str)
+			err = FilterNoName(user.Token, str)
 			if err != nil {
 				go To(System, user.Token, errs.Msg(err))
 				continue
@@ -168,7 +168,9 @@ func To(from, to, msg string) {
 		Content: msg,
 	}
 	err := toP.Conn.WriteJSON(messages)
-	log.Println(err)
+	if err != nil {
+		log.Println(err)
+	}
 }
 func FilterNoName(token string, bytes []byte) error {
 	var fromP = ConnMCap[token]
@@ -188,6 +190,7 @@ func FilterNoName(token string, bytes []byte) error {
 	}
 	if msg.MsgType == NAMING {
 		fromP.ChineseName = msg.Content
+		return nil
 	}
 	if fromP.ChineseName == "" {
 		return errs.CustomError{
