@@ -5,14 +5,15 @@ import (
 	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
+	"os"
 )
 
 func init() {
-	//logFile, err := os.OpenFile("./ws.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
-	//if err != nil {
-	//	panic(err)
-	//}
-	//log.SetOutput(logFile) // 将文件设置为log输出的文件
+	logFile, err := os.OpenFile("./ws.log", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0766)
+	if err != nil {
+		panic(err)
+	}
+	log.SetOutput(logFile) // 将文件设置为log输出的文件
 	log.SetPrefix("TRACE: ")
 	log.SetFlags(log.Ldate | log.Lmicroseconds | log.Llongfile)
 }
@@ -46,6 +47,7 @@ func main() {
 	go removeUser(closeChan)
 	http.HandleFunc("/ws", Upgrade)
 	http.HandleFunc("/getFriend", GetFriend)
+	log.Println("准备启动")
 	err := http.ListenAndServe(":5900", nil)
 	if err != nil {
 		log.Println(err)
@@ -74,31 +76,36 @@ func Upgrade(w http.ResponseWriter, r *http.Request) {
 	//r.Cookie("name")
 	//log.Println(r.URL.String())
 
-	upgrader := websocket.Upgrader{}
+	upgrader := websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println(err)
 		return
 	}
 	user := model.NewUser(conn, "qiang")
+	log.Println("接入用户:", user)
 	connMap[user.Token] = user
 	go func(token string, closeChan chan<- string) {
 		for {
-			var msg model.Messages
-			err = conn.ReadJSON(&msg)
+			//var msg model.Mess
+			messageType, str, err := conn.ReadMessage()
 			if err != nil {
 				log.Println(err)
 				closeChan <- token
 				return
 			}
-			if msg.From != "" && msg.MsgType == 0 {
-				err = conn.WriteJSON(getUsers())
-				if err != nil {
-					log.Println(err)
-					return
-				}
+			switch messageType {
+			case websocket.CloseMessage:
+				closeChan <- token
+			case websocket.TextMessage:
+				log.Println(string(str))
+			default:
+				log.Println("接收到无意义数据:", string(str))
 			}
-			log.Println(msg)
 		}
 	}(user.Token, closeChan)
 }
